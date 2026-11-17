@@ -7,6 +7,7 @@ import {
   FileSearch,
   GitBranchPlus,
   GitMerge,
+  Lock,
   Network,
   Radar,
   Route,
@@ -20,6 +21,10 @@ import { ErrorBoundary } from './ErrorBoundary';
 import { ExploreWorkspaceTabs, type ExploreView } from './ExploreWorkspaceTabs';
 import { fetchAgentMemoryAvailability } from './explorerCapabilities';
 import { hasOntologyUrlState } from './workspaces/OntologyWorkspace/ontologyUrlState';
+import { WorkspaceSwitcher } from './auth/WorkspaceSwitcher';
+import { LoginModal } from './auth/LoginModal';
+import { UserSettingsModal } from './auth/UserSettingsModal';
+import { useAuth } from './auth/authStore';
 
 const DecisionWorkspace = lazy(() => import('./workspaces/DecisionWorkspace/DecisionWorkspace').then((module) => ({ default: module.DecisionWorkspace })));
 const DiffMergeWorkspace = lazy(() => import('./workspaces/DiffMergeWorkspace/DiffMergeWorkspace').then((module) => ({ default: module.DiffMergeWorkspace })));
@@ -35,8 +40,9 @@ const EntityResolutionTab = lazy(() => import('./workspaces/EnrichWorkspace/Enti
 const KGOverviewTab = lazy(() => import('./workspaces/ManageWorkspace/KGOverviewTab').then((module) => ({ default: module.KGOverviewTab })));
 const OntologySummaryTab = lazy(() => import('./workspaces/ManageWorkspace/OntologySummaryTab').then((module) => ({ default: module.OntologySummaryTab })));
 const OntologyWorkspace = lazy(() => import('./workspaces/OntologyWorkspace').then((module) => ({ default: module.OntologyWorkspace })));
+const AdminWorkspace = lazy(() => import('./workspaces/AdminWorkspace/AdminWorkspace').then((module) => ({ default: module.AdminWorkspace })));
 
-type WorkspaceId = 'welcome' | 'explore' | 'analyze' | 'decisions' | 'enrich' | 'manage' | 'ontology-hub';
+type WorkspaceId = 'welcome' | 'explore' | 'analyze' | 'decisions' | 'enrich' | 'manage' | 'ontology-hub' | 'admin';
 type AnalyzeView = 'sparql' | 'reasoning';
 type EnrichView = 'import' | 'merge' | 'registry' | 'resolve';
 type ManageView = 'lineage' | 'kg-overview' | 'ontology';
@@ -97,6 +103,9 @@ const navItems: NavItem[] = [
 ];
 
 function readInitialWorkspace(): WorkspaceId {
+  if (typeof window !== 'undefined' && (window.location.pathname === '/admin' || window.location.hash === '#admin')) {
+    return 'admin';
+  }
   return hasOntologyUrlState() ? 'ontology-hub' : 'welcome';
 }
 
@@ -1789,6 +1798,17 @@ export default function App() {
   const [exploreDraftDirty, setExploreDraftDirty] = useState(false);
   const [agentMemoryAvailable, setAgentMemoryAvailable] = useState(false);
 
+  const { user, isAuthenticated } = useAuth();
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+
+  const visibleNavItems: NavItem[] = [
+    ...navItems,
+    ...(user?.global_role === 'admin'
+      ? [{ id: 'admin' as WorkspaceId, label: '管理控制台', hint: '系统治理与安全管控', icon: ShieldCheck }]
+      : []),
+  ];
+
   useEffect(() => {
     let active = true;
     void fetchAgentMemoryAvailability().then((available) => {
@@ -1816,10 +1836,23 @@ export default function App() {
     if (activeWorkspace === "explore" && !confirmDiscardExploreDraft()) return;
     setExploreDraftDirty(false);
     setActiveWorkspace(nextWorkspace);
+    if (nextWorkspace === 'admin') {
+      window.history.pushState(null, '', '#admin');
+    }
   };
 
 
   const renderWorkspace = () => {
+    if (activeWorkspace === 'admin') {
+      return (
+        <ErrorBoundary key="admin">
+          <Suspense fallback={<WorkspaceFallback />}>
+            <AdminWorkspace />
+          </Suspense>
+        </ErrorBoundary>
+      );
+    }
+
     if (activeWorkspace === 'welcome') {
       return (
         <WelcomeScreen
@@ -2016,7 +2049,7 @@ export default function App() {
           <button className="brand-pill" title="COWIN 知识图谱" onClick={() => switchWorkspace('welcome')} style={{ cursor: 'pointer', border: '1px solid rgba(54, 110, 244,0.18)', padding: 0, background: 'transparent', overflow: 'hidden' }}>
             <img src="/favicon.png" alt="COWIN" width={34} height={34} style={{ display: 'block', borderRadius: 'inherit' }} />
           </button>
-          {navItems.map(({ id, label, hint, icon: Icon }) => (
+          {visibleNavItems.map(({ id, label, hint, icon: Icon }) => (
             <button
               key={id}
               className="nav-button"
@@ -2029,8 +2062,96 @@ export default function App() {
             </button>
           ))}
         </aside>
-        {renderWorkspace()}
+
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, height: '100%', overflow: 'hidden' }}>
+          {/* Top persistent header bar with WorkspaceSwitcher on Left & Auth/User on Right */}
+          <header
+            style={{
+              height: 48,
+              minHeight: 48,
+              background: '#ffffff',
+              borderBottom: '1px solid var(--ws-border)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '0 18px',
+              zIndex: 100,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <WorkspaceSwitcher />
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              {isAuthenticated && user ? (
+                <button
+                  type="button"
+                  onClick={() => setIsSettingsModalOpen(true)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    background: '#ffffff',
+                    border: '1px solid var(--ws-border)',
+                    borderRadius: 8,
+                    padding: '5px 10px',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: 'var(--ws-text)',
+                    cursor: 'pointer',
+                    transition: 'all 140ms ease',
+                  }}
+                  title="用户设置与 API 密钥"
+                >
+                  <div
+                    style={{
+                      width: 20,
+                      height: 20,
+                      borderRadius: '50%',
+                      background: 'var(--ws-accent-soft)',
+                      color: 'var(--ws-accent)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: 10,
+                      fontWeight: 800,
+                    }}
+                  >
+                    {user.username.charAt(0).toUpperCase()}
+                  </div>
+                  <span>{user.display_name || user.username}</span>
+                  <span
+                    className={`ws-pill ${
+                      user.global_role === 'admin'
+                        ? 'ws-pill--purple'
+                        : 'ws-pill--mono'
+                    }`}
+                    style={{ fontSize: 10, padding: '1px 5px' }}
+                  >
+                    {user.global_role}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setIsLoginModalOpen(true)}
+                  className="ws-btn ws-btn--primary"
+                  style={{ padding: '5px 12px', fontSize: 12 }}
+                >
+                  <Lock size={13} />
+                  <span>登 录</span>
+                </button>
+              )}
+            </div>
+          </header>
+
+          <main style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden' }}>
+            {renderWorkspace()}
+          </main>
+        </div>
       </div>
+      <LoginModal isOpen={isLoginModalOpen} onClose={() => setIsLoginModalOpen(false)} />
+      <UserSettingsModal isOpen={isSettingsModalOpen} onClose={() => setIsSettingsModalOpen(false)} />
     </QueryClientProvider>
   );
 }

@@ -6,7 +6,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +17,17 @@ from .. import __version__
 from ..context.agent_memory import AgentMemory
 from ..context.context_graph import ContextGraph
 from ..provenance.manager import storage_path_from_env
-from .dependencies import anonymous_access_allowed, get_expected_api_key, require_auth
+from .dependencies import (
+    AuthStore,
+    anonymous_access_allowed,
+    get_auth_store,
+    get_expected_api_key,
+    require_auth,
+)
 from .markdown_resources import MarkdownResourceRegistry
 from .runtime import explorer_capabilities, install_mutation_bridge
 from .session import GraphSession
+from .workspace_registry import WorkspaceSessionRegistry
 from .ws import ConnectionManager, install_graph_updates_websocket
 
 
@@ -62,6 +69,8 @@ def create_app(
     provenance_storage_path: Optional[str] = None,
     agent_memory: Optional[AgentMemory] = None,
     allowed_origins: Optional[Sequence[str]] = None,
+    auth_store: Optional[AuthStore] = None,
+    ldap_client: Optional[Any] = None,
 ) -> FastAPI:
     """Create an Explorer application over live graph and memory objects.
 
@@ -113,13 +122,24 @@ def create_app(
                 "routes will return 503 until SEMANTICA_API_KEY is set."
             )
 
+        # Build workspace session registry and register the default session.
+        registry = WorkspaceSessionRegistry(
+            provenance_storage_path=prov_path,
+        )
+        registry.register("default", active_session)
+
         app.state.event_loop = asyncio.get_running_loop()
         app.state.ws_manager = ConnectionManager()
-        app.state.session = active_session
+        app.state.session = active_session          # legacy compat
+        app.state.workspace_registry = registry     # multi-tenant registry
         app.state.agent_memory = agent_memory
         app.state.markdown_resources = markdown_resources
+        app.state.auth_store = auth_store or get_auth_store()
+        app.state.ldap_client = ldap_client
         install_mutation_bridge(app, active_session)
         yield
+        # Graceful shutdown: close all workspace sessions
+        registry.shutdown()
 
     app = FastAPI(
         title="Semantica Knowledge Explorer",
@@ -129,6 +149,8 @@ def create_app(
     )
 
     app.state.explorer_settings = settings
+    app.state.auth_store = auth_store or get_auth_store()
+    app.state.ldap_client = ldap_client
 
     # allow_credentials lets browsers send cookies/auth headers cross-origin.
     # Credentials aren't needed for the X-API-Key auth scheme below, and
@@ -141,7 +163,7 @@ def create_app(
         allow_origins=settings["allowed_origins"],
         allow_credentials=_allow_credentials,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+        allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Workspace-ID"],
         max_age=600,
     )
 
@@ -165,11 +187,14 @@ def create_app(
         _logger.exception("Unhandled exception")
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
+    from ..auth.routes import router as auth_router
+    from ..auth.admin_routes import router as admin_router
     from .routes.analytics import router as analytics_router
     from .routes.annotations import router as annotations_router
     from .routes.decisions import router as decisions_router
     from .routes.enrich import router as enrich_router
     from .routes.export_import import router as export_import_router
+    from .routes.federated import router as federated_router
     from .routes.graph import router as graph_router
     from .routes.markdown import router as markdown_router
     from .routes.memories import router as memories_router
@@ -179,8 +204,13 @@ def create_app(
     from .routes.temporal import router as temporal_router
     from .routes.vocabulary import router as vocabulary_router
 
+    # Mount unauthenticated authentication routes (login)
+    app.include_router(auth_router)
+    app.include_router(admin_router)
+
     _auth = [Depends(require_auth)]
     app.include_router(graph_router, dependencies=_auth)
+    app.include_router(federated_router, dependencies=_auth)
     app.include_router(analytics_router, dependencies=_auth)
     app.include_router(decisions_router, dependencies=_auth)
     app.include_router(temporal_router, dependencies=_auth)
